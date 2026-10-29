@@ -31,6 +31,9 @@ pub mod util;
 /// Custom middleware implementation.
 pub mod middleware;
 
+/// HTTP error responses.
+pub mod error;
+
 /// Password hashing and verification.
 pub mod password;
 

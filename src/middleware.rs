@@ -1,18 +1,16 @@
-use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform};
-use actix_web::http::header::CONTENT_LENGTH;
-use actix_web::http::StatusCode;
-use actix_web::{body::EitherBody, Error};
-use actix_web::{HttpMessage, HttpResponseBuilder};
+use axum::body::Body;
+use axum::extract::Request;
+use axum::http::header::CONTENT_LENGTH;
+use axum::http::StatusCode;
+use axum::response::Response;
 use byte_unit::Byte;
-use futures_util::{Future, TryStreamExt};
-use std::{
-    future::{ready, Ready},
-    pin::Pin,
-    rc::Rc,
-};
+use futures_util::future::BoxFuture;
+use futures_util::TryStreamExt;
+use std::task::{Context, Poll};
+use tower::{Layer, Service};
 
 /// Content length limiter middleware.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct ContentLengthLimiter {
     // Maximum amount of bytes to allow.
     max_bytes: Byte,
@@ -25,44 +23,40 @@ impl ContentLengthLimiter {
     }
 }
 
-impl<S, B> Transform<S, ServiceRequest> for ContentLengthLimiter
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<EitherBody<B>>;
-    type Error = Error;
-    type Transform = ContentLengthLimiterMiddleware<S>;
-    type InitError = ();
-    type Future = Ready<Result<Self::Transform, Self::InitError>>;
-    fn new_transform(&self, service: S) -> Self::Future {
-        ready(Ok(ContentLengthLimiterMiddleware {
-            service: Rc::new(service),
+impl<S> Layer<S> for ContentLengthLimiter {
+    type Service = ContentLengthLimiterMiddleware<S>;
+
+    fn layer(&self, service: S) -> Self::Service {
+        ContentLengthLimiterMiddleware {
+            service,
             max_bytes: self.max_bytes,
-        }))
+        }
     }
 }
 
 /// Content length limiter middleware implementation.
-#[derive(Debug)]
+///
+/// Only the `Content-Length` header is checked; a chunked body is not limited.
+#[derive(Clone, Debug)]
 pub struct ContentLengthLimiterMiddleware<S> {
-    service: Rc<S>,
+    service: S,
     max_bytes: Byte,
 }
 
-impl<S, B> Service<ServiceRequest> for ContentLengthLimiterMiddleware<S>
+impl<S> Service<Request> for ContentLengthLimiterMiddleware<S>
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: 'static,
-    B: 'static,
+    S: Service<Request, Response = Response> + Send + 'static,
+    S::Future: Send + 'static,
 {
-    type Response = ServiceResponse<EitherBody<B>>;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
-    forward_ready!(service);
-    fn call(&self, mut request: ServiceRequest) -> Self::Future {
-        let service = Rc::clone(&self.service);
+    type Response = Response;
+    type Error = S::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
         if let Some(content_length) = request
             .headers()
             .get(CONTENT_LENGTH)
@@ -75,22 +69,15 @@ where
                     content_length, self.max_bytes
                 );
                 return Box::pin(async move {
-                    // drain the body due to https://github.com/actix/actix-web/issues/2695
-                    let mut payload = request.take_payload();
+                    // drain the body so the client reads the response instead of a reset
+                    let mut payload = request.into_body().into_data_stream();
                     while let Ok(Some(_)) = payload.try_next().await {}
-                    Ok(request.into_response(
-                        HttpResponseBuilder::new(StatusCode::PAYLOAD_TOO_LARGE)
-                            .body("upload limit exceeded")
-                            .map_into_right_body(),
-                    ))
+                    let mut response = Response::new(Body::from("upload limit exceeded"));
+                    *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                    Ok(response)
                 });
             }
         }
-        Box::pin(async move {
-            service
-                .call(request)
-                .await
-                .map(ServiceResponse::map_into_left_body)
-        })
+        Box::pin(self.service.call(request))
     }
 }

@@ -1,22 +1,22 @@
-use actix_web::middleware::Logger;
-use actix_web::web::Data;
-use actix_web::{App, HttpServer};
-use awc::ClientBuilder;
+use axum::extract::Request;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use hotwatch::notify::event::ModifyKind;
 use hotwatch::{Event, EventKind, Hotwatch};
 use rustypaste::config::{Config, ServerConfig};
 use rustypaste::middleware::ContentLengthLimiter;
 use rustypaste::paste::PasteType;
-use rustypaste::server;
+use rustypaste::server::{self, AppState};
 use rustypaste::util;
 use rustypaste::CONFIG_ENV;
 use std::env;
 use std::fs;
 use std::io::Result as IoResult;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter,
 };
@@ -31,7 +31,7 @@ extern crate tracing;
 /// * initializes the logger
 /// * creates the necessary directories
 /// * spawns the threads
-fn setup(config_folder: &Path) -> IoResult<(Data<RwLock<Config>>, ServerConfig, Hotwatch)> {
+fn setup(config_folder: &Path) -> IoResult<(Arc<RwLock<Config>>, ServerConfig, Hotwatch)> {
     // Load the .env file.
     dotenvy::dotenv().ok();
 
@@ -91,8 +91,8 @@ fn setup(config_folder: &Path) -> IoResult<(Data<RwLock<Config>>, ServerConfig, 
     .expect("failed to initialize configuration file watcher");
 
     // Hot-reload the configuration file.
-    let config = Data::new(RwLock::new(config));
-    let cloned_config = Data::clone(&config);
+    let config = Arc::new(RwLock::new(config));
+    let cloned_config = Arc::clone(&config);
     let config_watcher = move |event: Event| {
         if let (EventKind::Modify(ModifyKind::Data(_)), Some(path)) =
             (event.kind, event.paths.first())
@@ -175,38 +175,64 @@ fn setup(config_folder: &Path) -> IoResult<(Data<RwLock<Config>>, ServerConfig, 
     Ok((config, server_config, hotwatch))
 }
 
-#[actix_web::main]
-async fn main() -> IoResult<()> {
+/// Logs every request with its status and duration.
+async fn log_request(request: Request, next: Next) -> Response {
+    let line = format!(
+        "\"{} {} {:?}\"",
+        request.method(),
+        request.uri(),
+        request.version()
+    );
+    let start = Instant::now();
+    let response = next.run(request).await;
+    info!(
+        "{} {} {:.6}",
+        line,
+        response.status().as_u16(),
+        start.elapsed().as_secs_f64()
+    );
+    response
+}
+
+fn main() -> IoResult<()> {
     // Set up the application.
     let (config, server_config, _hotwatch) = setup(&PathBuf::new())?;
 
-    // Create an HTTP server.
-    let mut http_server = HttpServer::new(move || {
-        let http_client = ClientBuilder::new()
-            .timeout(
-                server_config
-                    .timeout
-                    .unwrap_or_else(|| Duration::from_secs(30)),
-            )
-            .disable_redirects()
-            .finish();
-        App::new()
-            .app_data(Data::clone(&config))
-            .app_data(Data::new(http_client))
-            .wrap(Logger::new(
-                "%{r}a \"%r\" %s %b \"%{Referer}i\" \"%{User-Agent}i\" %T",
-            ))
-            .wrap(ContentLengthLimiter::new(server_config.max_content_length))
-            .configure(server::configure_routes)
-    })
-    .bind(&server_config.address)?;
-
     // Set worker count for the server.
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
     if let Some(workers) = server_config.workers {
-        http_server = http_server.workers(workers);
+        runtime.worker_threads(workers);
     }
+    runtime
+        .enable_all()
+        .build()?
+        .block_on(serve(config, server_config))
+}
+
+/// Runs the HTTP server.
+async fn serve(config: Arc<RwLock<Config>>, server_config: ServerConfig) -> IoResult<()> {
+    // Create an HTTP client for remote uploads.
+    let client = reqwest::Client::builder()
+        .timeout(
+            server_config
+                .timeout
+                .unwrap_or_else(|| Duration::from_secs(30)),
+        )
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(std::io::Error::other)?;
+    let app = server::router(AppState { config, client })
+        .layer(ContentLengthLimiter::new(server_config.max_content_length))
+        .layer(middleware::from_fn(log_request));
+
+    // Create an HTTP server.
+    let listener = tokio::net::TcpListener::bind(&server_config.address).await?;
 
     // Run the server.
     info!("Server is running at {}", server_config.address);
-    http_server.run().await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }

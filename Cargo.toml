@@ -14,15 +14,18 @@ include = ["src/**/*", "Cargo.*", "LICENSE", "README.md", "CHANGELOG.md"]
 
 [features]
 default = ["rustls"]
-openssl = ["actix-web/openssl", "awc/openssl"]
-rustls = ["actix-web/rustls-0_23", "awc/rustls-0_23-webpki-roots"]
+openssl = ["reqwest/native-tls"]
+rustls = ["reqwest/rustls-tls-webpki-roots"]
 
 [dependencies]
-actix-web = { version = "4.13.0" }
-actix-web-grants = { version = "4.1.2" }
-actix-multipart = "0.8.0"
-actix-files = "0.7.0"
-awc = { version = "3.8.2" }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["fs"] }
+multer = "3.1.0"
+reqwest = { version = "0.12.28", default-features = false }
+percent-encoding = "2.3.2"
+serde_json = "1.0.145"
+serde_urlencoded = "0.7.1"
 serde = "1.0.229"
 futures-util = "0.3.33"
 argon2 = "0.6"
@@ -44,7 +47,7 @@ glob = "0.3.4"
 ring = "0.17.14"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 hotwatch = "0.5.0"
-tokio = { version = "1.53.1", optional = true }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uts2ts = "1.0.0"
@@ -65,7 +68,7 @@ version = "0.22.0"
 default-features = false
 
 [dev-dependencies]
-actix-rt = "2.11.0"
+http-body-util = "0.1.3"
 
 [profile.dev]
 opt-level = 0

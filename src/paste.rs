@@ -1,9 +1,9 @@
 use crate::config::Config;
+use crate::error::{self, Error};
 use crate::file::Directory;
 use crate::header::ContentDisposition;
 use crate::util;
-use actix_web::{error, web, Error};
-use awc::Client;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult, Write};
@@ -142,7 +142,7 @@ impl Paste {
                 if mime_type == file_type.mime_type()
                     || (mime_type.ends_with('/') && file_type.mime_type().starts_with(mime_type))
                 {
-                    return Err(error::ErrorUnsupportedMediaType(
+                    return Err(error::unsupported_media_type(
                         "this file type is not permitted",
                     ));
                 }
@@ -152,12 +152,11 @@ impl Paste {
         if let Some(max_dir_size) = config.server.max_upload_dir_size {
             let file_size = u64::try_from(self.data.len()).unwrap_or_default();
             let upload_dir = self.type_.get_path(&config.server.upload_path)?;
-            let current_size_of_upload_dir = util::get_dir_size(&upload_dir).map_err(|e| {
-                error::ErrorInternalServerError(format!("could not get directory size: {e}"))
-            })?;
+            let current_size_of_upload_dir = util::get_dir_size(&upload_dir)
+                .map_err(|e| error::internal(format!("could not get directory size: {e}")))?;
             let expected_size_of_upload_dir = current_size_of_upload_dir.add(file_size);
             if expected_size_of_upload_dir > max_dir_size {
-                return Err(error::ErrorInsufficientStorage(
+                return Err(error::insufficient_storage(
                     "upload directory size limit exceeded",
                 ));
             }
@@ -248,7 +247,7 @@ impl Paste {
             break;
         }
         let (mut path, file_name) =
-            selected.ok_or_else(|| error::ErrorConflict("file already exists\n"))?;
+            selected.ok_or_else(|| error::conflict("file already exists\n"))?;
         if let Some(timestamp) = expiry_date {
             path.set_file_name(format!("{file_name}.{timestamp}"));
         }
@@ -257,7 +256,7 @@ impl Paste {
         let password = if self.type_.is_protected() {
             let pwd = crate::password::generate_password();
             crate::password::store_password_hash(&path, &pwd)
-                .map_err(|e| error::ErrorInternalServerError(format!("password storage: {e}")))?;
+                .map_err(|e| error::internal(format!("password storage: {e}")))?;
             Some(pwd)
         } else {
             None
@@ -273,7 +272,7 @@ impl Paste {
                 if self.type_.is_protected() {
                     let _ = crate::password::delete_password_file(&path);
                 }
-                return Err(error::ErrorConflict("file already exists\n"));
+                return Err(error::conflict("file already exists\n"));
             }
             Err(e) => return Err(e.into()),
         };
@@ -300,16 +299,16 @@ impl Paste {
         client: &Client,
         config: &RwLock<Config>,
     ) -> Result<UploadResult, Error> {
-        let data = str::from_utf8(&self.data).map_err(error::ErrorBadRequest)?;
-        let url = Url::parse(data).map_err(error::ErrorBadRequest)?;
+        let data = str::from_utf8(&self.data).map_err(error::bad_request)?;
+        let url = Url::parse(data).map_err(error::bad_request)?;
         let url_clone = url.clone();
-        match web::block(move || util::validate_remote_url(&url_clone)).await {
+        match tokio::task::spawn_blocking(move || util::validate_remote_url(&url_clone)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 warn!("URL validation failed for {}: {}", url, e);
-                return Err(error::ErrorBadRequest("invalid remote URL\n"));
+                return Err(error::bad_request("invalid remote URL\n"));
             }
-            Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+            Err(e) => return Err(error::internal(e.to_string())),
         }
         let file_name = url
             .path_segments()
@@ -320,23 +319,31 @@ impl Paste {
             .get(url.as_str())
             .send()
             .await
-            .map_err(error::ErrorInternalServerError)?;
-        let payload_limit = config
+            .map_err(error::internal)?;
+        let payload_limit: usize = config
             .read()
-            .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
+            .map_err(|_| error::internal("cannot acquire config"))?
             .server
             .max_content_length
             .try_into()
-            .map_err(error::ErrorInternalServerError)?;
-        let bytes = response
-            .body()
-            .limit(payload_limit)
-            .await
-            .map_err(error::ErrorInternalServerError)?
-            .to_vec();
+            .map_err(error::internal)?;
+        let overflow = || error::internal("payload reached size limit");
+        if response
+            .content_length()
+            .is_some_and(|length| length > payload_limit as u64)
+        {
+            return Err(overflow());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(error::internal)? {
+            if bytes.len() + chunk.len() > payload_limit {
+                return Err(overflow());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         let config = config
             .read()
-            .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
+            .map_err(|_| error::internal("cannot acquire config"))?;
         let bytes_checksum = util::sha256_digest(&*bytes)?;
         self.data = bytes;
         if !config.paste.duplicate_files.unwrap_or(true) && expiry_date.is_none() {
@@ -399,14 +406,12 @@ mod tests {
     use super::*;
     use crate::random::{RandomURLConfig, RandomURLType};
     use crate::util;
-    use actix_web::web::Data;
-    use awc::ClientBuilder;
     use byte_unit::Byte;
     use std::env;
     use std::str::FromStr;
     use std::time::Duration;
 
-    #[actix_rt::test]
+    #[tokio::test]
     #[allow(deprecated)]
     async fn test_paste_data() -> Result<(), Error> {
         let mut config = Config::default();
@@ -633,11 +638,10 @@ mod tests {
             data: url.as_bytes().to_vec(),
             type_: PasteType::RemoteFile,
         };
-        let client_data = Data::new(
-            ClientBuilder::new()
-                .timeout(Duration::from_secs(30))
-                .finish(),
-        );
+        let client_data = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(error::internal)?;
         let result = paste
             .store_remote_file(None, None, &client_data, &RwLock::new(config.clone()))
             .await?;
@@ -659,11 +663,10 @@ mod tests {
             data: url.as_bytes().to_vec(),
             type_: PasteType::RemoteFile,
         };
-        let client_data = Data::new(
-            ClientBuilder::new()
-                .timeout(Duration::from_secs(30))
-                .finish(),
-        );
+        let client_data = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(error::internal)?;
         let result = paste
             .store_remote_file(
                 None,
@@ -700,7 +703,7 @@ mod tests {
     const ALPHANUMERIC_CHARS: &str =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-    #[actix_rt::test]
+    #[tokio::test]
     async fn test_random_url_retry_on_collision() -> Result<(), Error> {
         let dir = env::current_dir()?.join("test_random_url_retry_on_collision");
         let _ = fs::remove_dir_all(&dir);
@@ -733,7 +736,7 @@ mod tests {
         Ok(())
     }
 
-    #[actix_rt::test]
+    #[tokio::test]
     async fn test_random_url_retry_exhausted() -> Result<(), Error> {
         let dir = env::current_dir()?.join("test_random_url_retry_exhausted");
         let _ = fs::remove_dir_all(&dir);
@@ -760,13 +763,13 @@ mod tests {
         let error = paste
             .store_file("upload.txt", None, None, &config)
             .expect_err("random name should have been exhausted");
-        assert_eq!(409, error.error_response().status());
+        assert_eq!(409, error.status());
 
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
-    #[actix_rt::test]
+    #[tokio::test]
     async fn test_random_url_header_filename_not_retried() -> Result<(), Error> {
         let dir = env::current_dir()?.join("test_random_url_header_filename_not_retried");
         let _ = fs::remove_dir_all(&dir);
@@ -791,13 +794,13 @@ mod tests {
         let error = paste
             .store_file("upload.txt", None, Some("taken.txt".to_string()), &config)
             .expect_err("header filename collision should not be retried");
-        assert_eq!(409, error.error_response().status());
+        assert_eq!(409, error.status());
 
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
-    #[actix_rt::test]
+    #[tokio::test]
     async fn test_random_url_suffix_mode_not_compounded_across_retries() -> Result<(), Error> {
         let dir =
             env::current_dir()?.join("test_random_url_suffix_mode_not_compounded_across_retries");
