@@ -1,4 +1,3 @@
-use actix_files::file_extension_to_mime;
 use mime::{FromStrError, Mime};
 use regex::Regex;
 use std::path::PathBuf;
@@ -23,11 +22,12 @@ pub fn get_mime_type(
     file_name: String,
 ) -> Result<Mime, FromStrError> {
     let path = PathBuf::from(&file_name);
-    let mut mime_type = file_extension_to_mime(
+    let mut mime_type = mime_guess::from_ext(
         path.extension()
             .and_then(|v| v.to_str())
             .unwrap_or_default(),
-    );
+    )
+    .first_or_octet_stream();
     for matcher in mime_matchers {
         if matcher
             .regex

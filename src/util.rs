@@ -1,5 +1,5 @@
+use crate::error::{self, Error};
 use crate::paste::PasteType;
-use actix_web::{error, Error as ActixError};
 use glob::glob;
 use lazy_regex::{lazy_regex, Lazy, Regex};
 use path_clean::PathClean;
@@ -17,29 +17,28 @@ use url::Url;
 pub static TIMESTAMP_EXTENSION_REGEX: Lazy<Regex> = lazy_regex!(r#"\.[0-9]{10,}$"#);
 
 /// Returns the system time as [`Duration`](Duration).
-pub fn get_system_time() -> Result<Duration, ActixError> {
+pub fn get_system_time() -> Result<Duration, Error> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(error::ErrorInternalServerError)
+        .map_err(error::internal)
 }
 
 /// Returns the first _unexpired_ path matched by a custom glob pattern.
 ///
 /// The file extension is accepted as a timestamp that points to the expiry date.
-pub fn glob_match_file(mut path: PathBuf) -> Result<PathBuf, ActixError> {
+pub fn glob_match_file(mut path: PathBuf) -> Result<PathBuf, Error> {
     path = PathBuf::from(
         TIMESTAMP_EXTENSION_REGEX
             .replacen(
-                path.to_str().ok_or_else(|| {
-                    error::ErrorInternalServerError("path contains invalid characters")
-                })?,
+                path.to_str()
+                    .ok_or_else(|| error::internal("path contains invalid characters"))?,
                 1,
                 "",
             )
             .to_string(),
     );
     if let Some(glob_path) = glob(&format!("{}.[0-9]*", path.to_string_lossy()))
-        .map_err(error::ErrorInternalServerError)?
+        .map_err(error::internal)?
         .filter(|r| {
             // we do not want password files, otherwise further processing fails
             r.as_ref()
@@ -50,7 +49,7 @@ pub fn glob_match_file(mut path: PathBuf) -> Result<PathBuf, ActixError> {
         })
         .last()
     {
-        let glob_path = glob_path.map_err(error::ErrorInternalServerError)?;
+        let glob_path = glob_path.map_err(error::internal)?;
         if let Some(extension) = glob_path
             .extension()
             .and_then(|v| v.to_str())
@@ -156,7 +155,7 @@ pub fn get_orphaned_password_files(base_path: &Path) -> Vec<PathBuf> {
 }
 
 /// Returns the SHA256 digest of the given input.
-pub fn sha256_digest<R: Read>(input: R) -> Result<String, ActixError> {
+pub fn sha256_digest<R: Read>(input: R) -> Result<String, Error> {
     let mut reader = BufReader::new(input);
     let mut context = Context::new(&SHA256);
     let mut buffer = [0; 1024];
@@ -341,6 +340,16 @@ fn is_disallowed_ipv6(v6: std::net::Ipv6Addr) -> bool {
 }
 
 #[allow(clippy::unwrap_used)]
+/// Whether `host` can be resolved. The tests that need a public host skip, with a note, when it cannot; with DNS they run in full.
+#[cfg(test)]
+pub(crate) fn public_host_resolves(host: &str) -> bool {
+    let resolves = std::net::ToSocketAddrs::to_socket_addrs(&(host, 443)).is_ok();
+    if !resolves {
+        eprintln!("skipped: {host} cannot be resolved");
+    }
+    resolves
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,7 +357,7 @@ mod tests {
     use std::fs;
     use std::thread;
     #[test]
-    fn test_system_time() -> Result<(), ActixError> {
+    fn test_system_time() -> Result<(), Error> {
         let system_time = get_system_time()?.as_millis();
         thread::sleep(Duration::from_millis(1));
         assert!(system_time < get_system_time()?.as_millis());
@@ -356,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn test_glob_match() -> Result<(), ActixError> {
+    fn test_glob_match() -> Result<(), Error> {
         let path = PathBuf::from(format!(
             "expired.file1.{}",
             get_system_time()?.as_millis() + 50
@@ -375,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256sum() -> Result<(), ActixError> {
+    fn test_sha256sum() -> Result<(), Error> {
         assert_eq!(
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
             sha256_digest(String::from("test").as_bytes())?
@@ -388,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_expired_files() -> Result<(), ActixError> {
+    fn test_get_expired_files() -> Result<(), Error> {
         let current_dir = env::current_dir()?;
         let expiration_time = get_system_time()?.as_millis() + 50;
         let path = PathBuf::from(format!("expired.file2.{expiration_time}"));
@@ -405,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_orphaned_password_files() -> Result<(), ActixError> {
+    fn test_get_orphaned_password_files() -> Result<(), Error> {
         let test_dir = env::temp_dir().join("rustypaste_orphan_test");
         let protected_dir = test_dir.join("protected");
 
@@ -462,12 +471,18 @@ mod tests {
 
     #[test]
     fn test_validate_remote_url_valid_https() {
+        if !public_host_resolves("example.com") {
+            return;
+        }
         let url = Url::parse("https://example.com/file.txt").unwrap();
         assert!(validate_remote_url(&url).is_ok());
     }
 
     #[test]
     fn test_validate_remote_url_valid_http() {
+        if !public_host_resolves("example.com") {
+            return;
+        }
         let url = Url::parse("http://example.com/file.txt").unwrap();
         assert!(validate_remote_url(&url).is_ok());
     }

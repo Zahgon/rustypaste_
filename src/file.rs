@@ -1,5 +1,5 @@
+use crate::error::{self, Error};
 use crate::util;
-use actix_web::{error, Error as ActixError};
 use glob::glob;
 use std::convert::TryFrom;
 use std::fs::File as OsFile;
@@ -21,12 +21,16 @@ pub struct Directory {
 }
 
 impl<'a> TryFrom<&'a Path> for Directory {
-    type Error = ActixError;
+    type Error = Error;
     fn try_from(directory: &'a Path) -> Result<Self, Self::Error> {
-        let files = glob(directory.join("**").join("*").to_str().ok_or_else(|| {
-            error::ErrorInternalServerError("directory contains invalid characters")
-        })?)
-        .map_err(error::ErrorInternalServerError)?
+        let files = glob(
+            directory
+                .join("**")
+                .join("*")
+                .to_str()
+                .ok_or_else(|| error::internal("directory contains invalid characters"))?,
+        )
+        .map_err(error::internal)?
         .filter_map(Result::ok)
         .filter(|path| !path.is_dir())
         .filter_map(|path| match OsFile::open(&path) {
@@ -58,7 +62,7 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
-    fn test_file_checksum() -> Result<(), ActixError> {
+    fn test_file_checksum() -> Result<(), Error> {
         assert_eq!(
             Some(OsString::from("rustypaste_logo.png").as_ref()),
             Directory::try_from(
